@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis()
         );
         PathBuf::from(format!(r"\\.\pipe\openssh-ssh-agent-{}", unique_id))
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .stderr(if has_debug {
             std::process::Stdio::inherit()
         } else {
-            std::process::Stdio::null()
+            std::process::Stdio::piped()
         })
         .spawn()
         .map_err(|e| format!("Failed to start ssh-agent-filter ({:?}): {}", filter_exe, e))?;
@@ -188,7 +188,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..100 {
         // Check if filter child exited early
         if let Some(status) = filter_child.try_wait()? {
-            return Err(format!("ssh-agent-filter exited early with status: {}", status).into());
+            let mut err_msg = format!("ssh-agent-filter exited early with status: {}", status);
+            if let Some(mut stderr) = filter_child.stderr.take() {
+                let mut err_buf = Vec::new();
+                if tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut err_buf).await.is_ok() {
+                    if !err_buf.is_empty() {
+                        err_msg.push_str(&format!("\nstderr:\n{}", String::from_utf8_lossy(&err_buf)));
+                    }
+                }
+            }
+            return Err(err_msg.into());
         }
 
         #[cfg(windows)]
@@ -214,19 +223,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !ready {
         let _ = filter_child.kill().await;
-        return Err("ssh-agent-filter failed to start listening in time".into());
+        let mut err_msg = "ssh-agent-filter failed to start listening in time".to_string();
+        if let Some(mut stderr) = filter_child.stderr.take() {
+            let mut err_buf = Vec::new();
+            if tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut err_buf).await.is_ok() {
+                if !err_buf.is_empty() {
+                    err_msg.push_str(&format!("\nstderr:\n{}", String::from_utf8_lossy(&err_buf)));
+                }
+            }
+        }
+        return Err(err_msg.into());
     }
 
     // Spawn ssh process with SSH_AUTH_SOCK pointed to the filtered socket/pipe
-    let mut ssh_child = tokio::process::Command::new("ssh")
+    let mut ssh_child = match tokio::process::Command::new("ssh")
         .arg("-A")
         .args(&ssh_args)
         .env("SSH_AUTH_SOCK", &listen_path)
         .spawn()
-        .map_err(|e| format!("Failed to spawn ssh command: {}", e))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = filter_child.kill().await;
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(&listen_path);
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+            return Err(format!("Failed to spawn ssh command: {}", e).into());
+        }
+    };
 
     // Wait for ssh to complete
-    let exit_status = ssh_child.wait().await?;
+    let exit_status = match ssh_child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = filter_child.kill().await;
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(&listen_path);
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+            return Err(e.into());
+        }
+    };
 
     // Clean up ssh-agent-filter
     let _ = filter_child.kill().await;
@@ -237,5 +277,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    std::process::exit(exit_status.code().unwrap_or(0));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = exit_status.code() {
+            std::process::exit(code);
+        } else if let Some(signal) = exit_status.signal() {
+            std::process::exit(128 + signal);
+        } else {
+            std::process::exit(1);
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::process::exit(exit_status.code().unwrap_or(0));
+    }
 }

@@ -1,7 +1,8 @@
 [package]
 name = "ssh-agent-filter-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1.38", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "process", "time"] }
@@ -12,8 +13,15 @@ hex = { version = "0.4" }
 
 [[bin]]
 name = "ssh-agent-filter"
-path = "src/main.rs"
+path = "src/ssh-agent-filter.rs"
 
 [[bin]]
 name = "afssh"
-path = "src/bin/afssh.rs"
+path = "src/afssh.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

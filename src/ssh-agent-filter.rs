@@ -426,6 +426,10 @@ async fn setup_filters(
     let mut allowed_keys = HashSet::new();
     let mut confirmed_keys = HashMap::new();
     
+    let mut matched_comments = HashSet::new();
+    let mut matched_md5s = HashSet::new();
+    let mut matched_b64s = HashSet::new();
+    
     for _ in 0..key_count {
         let key = reader.read_string()?;
         let comment_bytes = reader.read_string()?;
@@ -449,6 +453,16 @@ async fn setup_filters(
                 eprintln!("-> Key allowed directly");
             }
             allowed_keys.insert(key.to_vec());
+            
+            if allowed_comments.contains(&comment) {
+                matched_comments.insert(comment.clone());
+            }
+            if allowed_md5s.contains(&md5) {
+                matched_md5s.insert(md5.clone());
+            }
+            if allowed_b64s.contains(&b64) {
+                matched_b64s.insert(b64.clone());
+            }
         } else {
             let is_confirmed = confirmed_comments.contains(&comment)
                 || confirmed_md5s.contains(&md5)
@@ -459,8 +473,52 @@ async fn setup_filters(
                 if debug {
                     eprintln!("-> Key allowed with confirmation");
                 }
-                confirmed_keys.insert(key.to_vec(), comment);
+                confirmed_keys.insert(key.to_vec(), comment.clone());
+                
+                if confirmed_comments.contains(&comment) {
+                    matched_comments.insert(comment.clone());
+                }
+                if confirmed_md5s.contains(&md5) {
+                    matched_md5s.insert(md5.clone());
+                }
+                if confirmed_b64s.contains(&b64) {
+                    matched_b64s.insert(b64.clone());
+                }
             }
+        }
+    }
+    
+    // Warn about unmatched configuration entries
+    for c in allowed_comments {
+        if !matched_comments.contains(c) {
+            eprintln!("Warning: Allowed key specified by comment '{}' was not found in the upstream agent.", c);
+        }
+    }
+    for c in confirmed_comments {
+        if !matched_comments.contains(c) {
+            eprintln!("Warning: Confirmed key specified by comment '{}' was not found in the upstream agent.", c);
+        }
+    }
+    for m in allowed_md5s {
+        if !matched_md5s.contains(m) {
+            eprintln!("Warning: Allowed key specified by fingerprint '{}' was not found in the upstream agent.", m);
+        }
+    }
+    for m in confirmed_md5s {
+        if !matched_md5s.contains(m) {
+            eprintln!("Warning: Confirmed key specified by fingerprint '{}' was not found in the upstream agent.", m);
+        }
+    }
+    for b in allowed_b64s {
+        if !matched_b64s.contains(b) {
+            let display_b = if b.len() > 20 { format!("{}...", &b[..20]) } else { b.clone() };
+            eprintln!("Warning: Allowed key specified by base64 pubkey '{}' was not found in the upstream agent.", display_b);
+        }
+    }
+    for b in confirmed_b64s {
+        if !matched_b64s.contains(b) {
+            let display_b = if b.len() > 20 { format!("{}...", &b[..20]) } else { b.clone() };
+            eprintln!("Warning: Confirmed key specified by base64 pubkey '{}' was not found in the upstream agent.", display_b);
         }
     }
     
@@ -491,29 +549,97 @@ async fn handle_connection(
         let mut reader = BufferReader::new(&req_packet);
         let msg_type = match reader.read_u8() {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(_) => {
+                let mut writer = BufferWriter::new();
+                writer.write_u8(SSH_AGENT_FAILURE);
+                let _ = write_packet(&mut client, &writer.into_inner()).await;
+                continue;
+            }
         };
 
         match msg_type {
             SSH2_AGENTC_REQUEST_IDENTITIES => {
-                let mut upstream = connect_upstream(upstream_path).await?;
-                write_packet(&mut upstream, &req_packet).await?;
-                
-                let resp_packet = read_packet(&mut upstream).await?;
-                let mut resp_reader = BufferReader::new(&resp_packet);
-                let resp_type = resp_reader.read_u8().unwrap_or(0);
-                if resp_type != SSH2_AGENT_IDENTITIES_ANSWER {
-                    write_packet(&mut client, &resp_packet).await?;
+                let mut upstream = match connect_upstream(upstream_path).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("Failed to connect to upstream ssh-agent: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = write_packet(&mut upstream, &req_packet).await {
+                    eprintln!("Failed to write to upstream ssh-agent: {}", e);
+                    let mut writer = BufferWriter::new();
+                    writer.write_u8(SSH_AGENT_FAILURE);
+                    let _ = write_packet(&mut client, &writer.into_inner()).await;
                     continue;
                 }
-                let key_count = resp_reader.read_u32().unwrap_or(0);
+                
+                let resp_packet = match read_packet(&mut upstream).await {
+                    Ok(pkt) => pkt,
+                    Err(e) => {
+                        eprintln!("Failed to read from upstream ssh-agent: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
+                };
+                let mut resp_reader = BufferReader::new(&resp_packet);
+                let resp_type = match resp_reader.read_u8() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Malformed response type from upstream agent: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
+                };
+                if resp_type != SSH2_AGENT_IDENTITIES_ANSWER {
+                    let _ = write_packet(&mut client, &resp_packet).await;
+                    continue;
+                }
+                let key_count = match resp_reader.read_u32() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Malformed response key count from upstream agent: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
+                };
                 let mut filtered_keys = Vec::new();
+                let mut parse_error = false;
                 for _ in 0..key_count {
-                    let key = resp_reader.read_string().unwrap_or(&[]);
-                    let comment = resp_reader.read_string().unwrap_or(&[]);
+                    let key = match resp_reader.read_string() {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("Malformed response key from upstream agent: {}", e);
+                            parse_error = true;
+                            break;
+                        }
+                    };
+                    let comment = match resp_reader.read_string() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Malformed response comment from upstream agent: {}", e);
+                            parse_error = true;
+                            break;
+                        }
+                    };
                     if allowed_keys.contains(key) || confirmed_keys.contains_key(key) {
                         filtered_keys.push((key.to_vec(), comment.to_vec()));
                     }
+                }
+                if parse_error {
+                    let mut writer = BufferWriter::new();
+                    writer.write_u8(SSH_AGENT_FAILURE);
+                    let _ = write_packet(&mut client, &writer.into_inner()).await;
+                    continue;
                 }
                 
                 let mut writer = BufferWriter::new();
@@ -528,11 +654,23 @@ async fn handle_connection(
             SSH2_AGENTC_SIGN_REQUEST => {
                 let key = match reader.read_string() {
                     Ok(k) => k,
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("Malformed sign request key: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
                 };
                 let data = match reader.read_string() {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("Malformed sign request data: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
                 };
 
                 let mut allow = false;
@@ -558,9 +696,33 @@ async fn handle_connection(
                 }
 
                 if allow {
-                    let mut upstream = connect_upstream(upstream_path).await?;
-                    write_packet(&mut upstream, &req_packet).await?;
-                    let resp_packet = read_packet(&mut upstream).await?;
+                    let mut upstream = match connect_upstream(upstream_path).await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("Failed to connect to upstream ssh-agent: {}", e);
+                            let mut writer = BufferWriter::new();
+                            writer.write_u8(SSH_AGENT_FAILURE);
+                            let _ = write_packet(&mut client, &writer.into_inner()).await;
+                            continue;
+                        }
+                    };
+                    if let Err(e) = write_packet(&mut upstream, &req_packet).await {
+                        eprintln!("Failed to write to upstream ssh-agent: {}", e);
+                        let mut writer = BufferWriter::new();
+                        writer.write_u8(SSH_AGENT_FAILURE);
+                        let _ = write_packet(&mut client, &writer.into_inner()).await;
+                        continue;
+                    }
+                    let resp_packet = match read_packet(&mut upstream).await {
+                        Ok(pkt) => pkt,
+                        Err(e) => {
+                            eprintln!("Failed to read from upstream ssh-agent: {}", e);
+                            let mut writer = BufferWriter::new();
+                            writer.write_u8(SSH_AGENT_FAILURE);
+                            let _ = write_packet(&mut client, &writer.into_inner()).await;
+                            continue;
+                        }
+                    };
                     write_packet(&mut client, &resp_packet).await?;
                 } else {
                     let mut writer = BufferWriter::new();
@@ -707,10 +869,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     #[cfg(unix)]
-    let upstream_path = cli.in_sock.clone().unwrap_or_else(|| {
-        std::env::var("SSH_AUTH_SOCK")
-            .expect("SSH_AUTH_SOCK environment variable must be set")
-    });
+    let upstream_path = match cli.in_sock.clone() {
+        Some(p) => p,
+        None => match std::env::var("SSH_AUTH_SOCK") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Error: SSH_AUTH_SOCK environment variable must be set.");
+                std::process::exit(1);
+            }
+        }
+    };
 
     // Setup output (listening) path
     #[cfg(windows)]

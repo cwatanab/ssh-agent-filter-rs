@@ -1,4 +1,4 @@
-# ssh-agent-filter-rust
+# ssh-agent-filter
 
 Rust reimplementation of `ssh-agent-filter` with cross-platform support.
 
@@ -29,7 +29,7 @@ You can run your `ssh` or `git` commands through `afssh` to automatically spawn 
 
 ```powershell
 # Windows Example
-.\target\release\afssh.exe -c cwatana3@github.com-auth -- git clone git@github.com:user/repo.git
+afssh -c alice@github.com-auth -- git clone git@github.com:user/repo.git
 ```
 
 ### Running ssh-agent-filter directly (persistent proxy)
@@ -39,7 +39,7 @@ You can run your `ssh` or `git` commands through `afssh` to automatically spawn 
 1. Ensure your upstream `ssh-agent` service is running and has keys loaded.
 2. Run the filter, specifying which keys to allow or require confirmation for:
    ```powershell
-   .\target\release\ssh-agent-filter.exe -A
+   ssh-agent-filter -A
    ```
    This will run in the foreground and output env variables to export, e.g.:
    ```powershell
@@ -56,6 +56,12 @@ You can run your `ssh` or `git` commands through `afssh` to automatically spawn 
 
 Run the filter:
 ```bash
-./target/release/ssh-agent-filter -A
+ssh-agent-filter -A
 ```
 It will daemonize by default (unless `-d`/`--debug` is passed) and print the appropriate `export SSH_AUTH_SOCK="..."` command.
+
+## License and Attribution
+
+This project is a Rust port/re-implementation of the original [ssh-agent-filter](https://github.com/tiwe-de/ssh-agent-filter) written in C++ by Timo Weingärtner.
+
+Both the original project and this implementation are distributed under the terms of the GNU General Public License version 3 (GPL-3.0 or later). See [LICENSE](file:///D:/Develop/ssh-agent-filter-rs/LICENSE) for the full license text.
