@@ -235,8 +235,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(err_msg.into());
     }
 
+    // Determine the ssh executable to run.
+    let ssh_exe = if cfg!(windows) {
+        let default_openssh = std::path::Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe");
+        if default_openssh.exists() {
+            default_openssh.to_string_lossy().to_string()
+        } else {
+            "ssh".to_string()
+        }
+    } else {
+        "ssh".to_string()
+    };
+
     // Spawn ssh process with SSH_AUTH_SOCK pointed to the filtered socket/pipe
-    let mut ssh_child = match tokio::process::Command::new("ssh")
+    let mut ssh_child = match tokio::process::Command::new(&ssh_exe)
         .arg("-A")
         .args(&ssh_args)
         .env("SSH_AUTH_SOCK", &listen_path)
